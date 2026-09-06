@@ -1,0 +1,108 @@
+# THE ONE QA PIPELINE THIS REPOSITORY HAS, and it runs for a release request and nothing else.
+#
+# qits-projects keeps a backing branch `release/<id>` per open release request — an octopus merge of
+# that request's sources, refolded whenever the set changes — and publishes `ReleaseRequestChanged`
+# on every successful re-fold. The merge primitive that writes that branch fires no `post-receive`
+# and so publishes no `SCMPublishCommit`: without this file the fold exists and NOTHING BUILDS IT.
+#
+# DECIDED AT MAIN, BUILT AT THE FOLD. This file is discovered, parsed and selected at `main`'s head,
+# always; only the run's branch and sha come from the payload, which is why `checkout:` names them as
+# a pair. A release request therefore cannot alter the CI that gates it by folding in a commit that
+# edits this file.
+#
+# THESE ARE LEGACY-SHAPED FILES ON PURPOSE. The whole point of this repository is the CLI the release
+# slots plan invokes from wrapper-owned archetypes, and this pair will be replaced by a
+# `.config/qits/release.yml` naming the `cli` archetype in the fleet sweep. It stays hand-written
+# until then for the same reason the engine ships before the repos migrate: the thing that publishes
+# the publisher must not depend on the publisher being published.
+event: ReleaseRequestChanged
+
+when:
+  # repoName, not repoId: the git host's storage coordinate is an opaque UUID since the identity
+  # cutover, so a name match on repoId is not dependable. The event echoes the public name; a rename
+  # updates this line in the same campaign.
+  - repoName: { exact: qits-artifacts-cli }
+
+checkout:
+  branch: backingBranch
+  sha: mergedSha
+
+steps:
+    # 1. The clone-alone gate. `./mvnw verify` with no docker, no credentials and no network beyond
+    #    Maven Central — the whole suite drives a real HTTP server on an ephemeral port, so nothing
+    #    here wants a store, a daemon or a container. It runs FIRST because it is the cheap gate: a
+    #    broken test must not cost a GraalVM native build.
+  - image: qits/build-images/maven-base:latest
+    timeout-seconds: 1800
+    script: |
+      # The daemon runs this with `bash -c` and no -e, so without this a failed build is swallowed
+      # and the run reports SUCCESS.
+      set -eu
+      # Maven Central through the platform mirror's in-network alias — empty (an older qits-ci that
+      # injects nothing, or a deployment with the mirror plane off) deactivates the settings profile
+      # and Central is resolved directly.
+      export QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}"
+      ./mvnw -B -ntp -s .qits-maven-settings.xml verify
+
+    # 2. The shipping form: a fully static musl native image. This repository ships no image at all,
+    #    so the native build IS the artifact and needs its own step.
+    #
+    #    `build: true`, AND NO SOCKET. Everything below is buildctl, so the step takes the build-mode
+    #    environment (the commissioned credential, $QITS_BUILD_REGISTRY, and the $BUILDKIT_HOST
+    #    qits-containers injects) WITHOUT root-equivalence on the host. There is no `docker: true`
+    #    half here and no smoke probe container: the `ldd` assertion inside docker/Dockerfile's build
+    #    RUN is what proves the musl/static half, and it proves it inside the build rather than after
+    #    it. (qits-ci-daemon keeps a probe because its contract is "run me with no environment and
+    #    exit 2", which only an exec can assert. This binary's equivalent — argv parsing, exit codes,
+    #    every route — is what the suite in step 1 covers, in eighty-odd cases.)
+  - image: qits/build-images/ci-base:latest
+    build: true
+    timeout-seconds: 3600
+    script: |
+      set -eu
+
+      # The platform builder, demanded loudly before anything is built. Unset means a
+      # qits-ci/qits-containers pair too old to inject it; EMPTY means the kill switch
+      # (qits.ci.buildkit.enabled=false spells off as empty-never-absent). Either way this recipe
+      # must fail here, naming the cause, rather than reach for a socket it is not handed.
+      : "${BUILDKIT_HOST:?the platform builder is off or not injected; this recipe builds only through it}"
+      : "${QITS_BUILD_REGISTRY:?}"
+
+      # --- the toolchain image, WHICH THIS REPOSITORY DOES NOT BUILD -------------------------------
+      # qits-ci-daemon authors `graalvmce-musl-builder` and its pipelines push this exact tag on
+      # every QA fold and every release; qits-bootstrap-cli builds the same file during a cold
+      # bootstrap. Copying that Dockerfile here would give the platform two spellings of one
+      # toolchain and two pipelines racing to overwrite one fixed tag. So this names the tag and
+      # buildctl resolves it from the registry — and if it is not there, the failure says which image
+      # could not be resolved, which is the honest one. docker/Dockerfile's header carries the
+      # argument.
+      builder="$QITS_BUILD_REGISTRY/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25"
+
+      # --- the binary ------------------------------------------------------------------------------
+      # docker/Dockerfile compiles inside that image and ends on a `FROM scratch` holding the one
+      # file, so the export writes out/qits-publish. The context is the checkout; `.dockerignore`
+      # keeps target/, .git and out/ out of it. No `--network host` and nothing replaces it: the RUN
+      # executes in the builder's namespace on qits-net, so Maven Central goes through the mirror's
+      # IN-NETWORK route ($QITS_MAVEN_PROXY_URL) and empty deactivates the settings profile so the
+      # resolve goes to Central directly.
+      #
+      # ci-event-release.yml runs this same invocation and adds the SBOM export; THE TWO MUST STAY
+      # BYTE-IDENTICAL in every buildctl argument, because the builder's cache is shared and that is
+      # what makes a release following a green fold a stack of cache hits rather than a second native
+      # compile.
+      buildctl build --frontend dockerfile.v0 \
+        --local context=. --local dockerfile=docker \
+        --opt target=binary \
+        --opt build-arg:BUILDER_IMAGE="$builder" \
+        --opt build-arg:QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+        --output type=local,dest=out
+
+      chmod +x out/qits-publish
+
+      # THE CHEAPEST POSSIBLE SMOKE TEST, and the one thing a fold can say that the suite cannot: the
+      # binary really executes on an alpine-family image. ci-base is one, and a glibc-linked binary
+      # answers "not found" here rather than printing usage. No store is dialled — `--help` talks to
+      # nothing.
+      ./out/qits-publish --help >/dev/null
+
+      echo "qits-publish built: $(sha256sum out/qits-publish | cut -d' ' -f1)"

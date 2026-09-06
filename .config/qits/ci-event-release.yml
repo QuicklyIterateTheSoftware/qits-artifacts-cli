@@ -1,0 +1,158 @@
+# The release pipeline: this repository reacts to its OWN release and publishes the binary under the
+# released VERSION.
+#
+# THE SELECTION NAMES THIS REPOSITORY, WHICH READS LIKE A LOOP AND IS NOT — the same shape every
+# sibling's release pipeline has. `SCMRelease` says only "source control has this version";
+# qits-projects publishes it the instant the release push is accepted, and nothing here publishes it.
+# The event that could loop is `SoftwareRelease`, and this file neither listens for it nor emits it.
+#
+# WHAT THIS BINARY IS. `qits-publish` is the platform's one publish client: it owns every direct HTTP
+# interaction with qits-artifacts and the idempotency policy around it. The composed release steps
+# qits-ci builds from `.config/qits/release.yml` + a wrapper archetype download it into a step
+# container and call it; the release-slots plan is the whole argument. Which means this pipeline
+# publishes the thing every other release pipeline will depend on — so it is deliberately the plainest
+# one on the platform, and it holds no logic that is not also in the binary.
+#
+# `artifacts:` IS A DECLARATION, NOT A REPORT. qits-ci never learns how to publish anything — the
+# publish below is this repository's own step, exactly as `npm publish` and `docker push` are
+# siblings' — so it cannot see what landed. It announces `SoftwareRelease {daemon,
+# qits-artifacts-cli}` on the strength of these two lines after the whole pipeline is green. Keep
+# them true.
+#
+# THE TYPE IS `daemon`, WHICH IS NOT A MISNOMER EITHER. The daemon-binary train is the platform's
+# route for "a static binary served as bytes under a name and a version", and this is one; the
+# `daemons` repository is where it lands and how qits-ci resolves $QITS_ARTIFACTS_CLI_URL. Nothing
+# about the type claims this program dials a control socket.
+event: SCMRelease
+when:
+  - repository: { exact: qits-artifacts-cli }
+# THE RUN IS ANCHORED AT THE TAG IT BUILDS. `SCMRelease` carries `commitSha` — the commit the tag
+# points at — and qits-ci resolves these two dot-paths. `branch: version` is not a misnomer: the key
+# is named for the run row's ref column, and a tag is a ref, which `clone --branch` resolves exactly
+# as it resolves a head. `optional: true` is the transition and stays until no old event can arrive:
+# an `SCMRelease` published before `commitSha` existed resolves nothing here, and without the flag
+# that would cost this pipeline its run — a released version whose artifact is silently never
+# published. With it such a run is recorded at main's head, and the `git fetch refs/tags/$version`
+# below is what supplies the released tree. That fetch therefore STAYS: a no-op on the anchored path,
+# the whole mechanism on the fallback one.
+checkout:
+  branch: version       # the tag's name — a ref name, which `clone --branch` resolves
+  sha: commitSha        # what it points at; absent on any release published before the field
+  optional: true        # ...and then this run is main's head, exactly as it was before
+artifacts:
+  - { type: daemon, name: qits-artifacts-cli }
+steps:
+    # ci-base: buildctl for the build, git for the tag checkout, jq for the event payload. Note what
+    # is NOT needed any more: no curl, because the binary this step just built is what makes the two
+    # PUTs.
+  - image: qits/build-images/ci-base:latest
+    build: true
+    timeout-seconds: 3600
+    script: |
+      # The daemon runs this with `bash -c` and no -e, so without this a failed build is swallowed:
+      # the publish sends whatever stale file is around, or none, and the run still reports SUCCESS —
+      # and a green release run is what makes qits-ci announce the artifact. -u makes an unset
+      # injected variable stop the step too.
+      set -eu
+
+      : "${BUILDKIT_HOST:?the platform builder is off or not injected; this recipe builds only through it}"
+      : "${QITS_BUILD_REGISTRY:?}"
+
+      # THE EVENT, READ AS DATA. The payload reaches the container verbatim as one string in
+      # $QITS_EVENT_PAYLOAD; there is no per-field projection.
+      version=$(printf '%s' "$QITS_EVENT_PAYLOAD" | jq -er .version)
+      # SCMRelease versions are CalVer — digits and dots. Checked before anything is built, because
+      # the version is a path segment in the publish below and a malformed one would otherwise
+      # publish under a coordinate nobody can guess.
+      case "$version" in
+        ''|*[!0-9.]*) echo "SCMRelease carries no valid CalVer" >&2; exit 1 ;;
+      esac
+      echo "releasing qits-artifacts-cli $version"
+
+      # THE TAG IS THE CHECKOUT TARGET. An event-triggered run is cloned at the head of main, which
+      # is where the release commit is *now* — a later push moves that and the tag does not, so a
+      # busy main cannot make this pipeline ship a different tree than the one that was released.
+      # The clone is shallow and carries no tags, hence the explicit refspec; the URL rather than
+      # `origin` because every address a step needs arrives as environment.
+      git fetch "$QITS_CI_REPOSITORY_URL" "refs/tags/$version:refs/tags/$version"
+      git checkout --detach "$version"
+
+      # --- the toolchain image, WHICH THIS REPOSITORY DOES NOT BUILD -------------------------------
+      # qits-ci-daemon authors it and its pipelines push this exact tag on every fold and every
+      # release. ci-event-release-request.yml beside this file carries the reasoning and must stay
+      # matched with the lines below, argument for argument, because the builder's cache is shared
+      # and that is what makes a release following a green fold a stack of cache hits.
+      builder="$QITS_BUILD_REGISTRY/$QITS_IMAGE_REPOSITORY/graalvmce-musl-builder:jdk-25"
+
+      # --- the binary -----------------------------------------------------------------------------
+      # The QA pipeline's build, byte for byte.
+      buildctl build --frontend dockerfile.v0 \
+        --local context=. --local dockerfile=docker \
+        --opt target=binary \
+        --opt build-arg:BUILDER_IMAGE="$builder" \
+        --opt build-arg:QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+        --output type=local,dest=out
+
+      # THE DOCUMENT COMES OUT OF THE SAME BUILD AS THE BINARY, and it has to: the project and its
+      # resolved dependency tree exist only in there — this step's own container carries no maven at
+      # all. `makeBom` rides on the Dockerfile's one mvnw invocation rather than a second one, so the
+      # document describes the very resolve that produced the bytes beside it, and the export below
+      # reaches a `FROM scratch AS sbom` stage holding just that file. Build-args are BYTE-IDENTICAL
+      # to the binary export above, which is what makes every layer a cache hit in the same builder
+      # and this export seconds rather than a second native compile.
+      buildctl build --frontend dockerfile.v0 \
+        --local context=. --local dockerfile=docker \
+        --opt target=sbom \
+        --opt build-arg:BUILDER_IMAGE="$builder" \
+        --opt build-arg:QITS_MAVEN_CENTRAL_URL="${QITS_MAVEN_PROXY_URL:-}" \
+        --output type=local,dest=out
+
+      chmod +x out/qits-publish
+
+      # --- the publish, MADE BY THE BINARY BEING PUBLISHED -----------------------------------------
+      # This is the one deliberate difference from qits-ci-daemon's release file, which spells both
+      # PUTs as curl with a hand-written status `case`. Three things follow from using the artifact
+      # itself instead, and all three are the point:
+      #
+      #  1. THE POLICY IS NOT RESTATED. `daemon submit` already means publish-if-absent with byte
+      #     verification: absent publishes, an occupied coordinate holding these exact bytes is
+      #     success, and one holding different bytes is a hard failure naming both digests. A
+      #     hand-written `case` here would be a second opinion about the rule this repository exists
+      #     to own — and the fleet's two contradictory opinions are precisely why it exists.
+      #  2. IT IS THE SMOKE TEST NO SUITE CAN WRITE. The binary runs on an alpine-family image,
+      #     statically, and completes a real conversation with a real store. If it cannot, this
+      #     release fails — which is right: a publish client that cannot publish must not be
+      #     published.
+      #  3. NO FALLBACK, and deliberately none. A silent fallback to curl is exactly what these files
+      #     exist to remove; a broken binary is meant to stop here.
+      #
+      # THE ADDRESS IS DERIVED HERE, ONCE, UNTIL qits-ci INJECTS IT. QITS_ARTIFACTS_URL is the
+      # variable the binary wants and the release-slots plan has qits-ci seed it into every step
+      # container. Until every deployment carries it, this line supplies it from the maven registry
+      # root — the injected variable that already carries this service's in-network origin
+      # (http://qits-artifacts:8080/...). NOT $QITS_REGISTRY, which is the host daemon's view of the
+      # registry and answers curl from in here with an instant connection refusal. The binary has the
+      # same fallback built in and would WARN its way to the same answer; spelling it here keeps the
+      # release log honest about which address was used.
+      export QITS_ARTIFACTS_URL="${QITS_ARTIFACTS_URL:-$(printf '%s' "$QITS_MAVEN_REGISTRY_URL" | sed -E 's#^(https?://[^/]+).*#\1#')}"
+
+      # THE PUT CARRIES NO CREDENTIAL, and that is the platform's posture rather than a gap: the
+      # daemon publish surface is tokenless like `npm publish`, `mvn deploy` and `docker push`,
+      # because on qits-net producers are trusted. What keeps it honest is immutability — a version
+      # can be added and can never be redefined. Machine auth arrives for every publish path at once,
+      # and when it does it is one release of this binary rather than a sweep of forty pipelines.
+      ./out/qits-publish daemon submit \
+        --name qits-artifacts-cli --version "$version" --file out/qits-publish
+
+      # --- the SBOM -------------------------------------------------------------------------------
+      # AFTER THE PUBLISH AND BEFORE THIS STEP EXITS GREEN, which is the ordering rule rather than a
+      # preference: qits-ci announces `SoftwareRelease` only for a green run, so a document stored
+      # here can never be missing for a version somebody was told about. A failed PUT fails the
+      # release ON PURPOSE — the store being down is not a reason to announce a version nobody can
+      # audit.
+      #
+      # THE PATH NAMES THE DECLARED ARTIFACT IDENTITY VERBATIM. `artifacts:` above says
+      # `{type: daemon, name: qits-artifacts-cli}`, and (packageType, packageName, version) is how the
+      # SoftwareRelease consumer will ask for it.
+      ./out/qits-publish sbom submit \
+        --type daemon --name qits-artifacts-cli --version "$version" --file out/sbom.json
