@@ -30,7 +30,7 @@
          half of what a pipeline declares is alpine-family. -->
     <groupId>eu.wohlben.qits</groupId>
     <artifactId>qits-artifacts-cli</artifactId>
-    <version>2026.906.0</version>
+    <version>2026.906.161553</version>
     <name>qits-artifacts-cli</name>
 
     <properties>
