@@ -1,0 +1,15 @@
+# What `docker/Dockerfile`'s `COPY . .` must NOT drag into the build context.
+#
+# A developer's tree carries target/ from host builds; copying it in makes the context large and —
+# worse — lets a stale artifact shadow what the builder stage compiles, so a green build can ship
+# bytes nobody just produced. .git is the same cost with none of the benefit: nothing in the build
+# reads history.
+target/
+**/target/
+.git/
+
+# And the build's OWN outputs, which land here as `--output type=local,dest=out`. Without this line
+# the release pipeline's second export (the SBOM stage) sends a context containing the binary the
+# first one just wrote, `COPY . .` hashes differently, and the document costs a whole second native
+# compile.
+out/

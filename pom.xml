@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- qits-publish: the platform's one publish client, compiled to a fully static musl GraalVM
+         native image and downloaded by every composed release step.
+
+         PARENTLESS, like every other qits repo: a clone of this repo alone must `./mvnw verify`
+         green with no monorepo, no docker, no credentials and no network beyond Maven Central.
+
+         ONE MODULE, and that is the difference from qits-ci-daemon's two: that repo's second module
+         exists because a wire contract is vendored into qits-ci-service and must be able to travel
+         without the application. Nothing here is shared with anything — the artifacts store owns
+         both ends of these routes, and this binary is the client half.
+
+         AND NO FRAMEWORK AT ALL, which is the bigger difference and the deliberate one. The sibling
+         daemons are Quarkus command-mode apps because they resolve configuration, hold a lifecycle
+         and want CDI to wire it. This program has none of that: argv comes in, HTTP goes out, an
+         exit code comes back, and the process ends. Quarkus would buy the native build integration
+         and charge for augmentation, a config layer with no keys in it, and a second opinion about
+         what a CLI is. `native-maven-plugin` gives the same binary from a plain `static void main`.
+
+         DEPENDENCIES, MAIN SCOPE: none, and that is a rule rather than a coincidence. JSON is read
+         and written by `Json` here (the documents are small and their shapes are pinned by the
+         store's routes), HTTP is `java.net.http`, hashing is `java.security.MessageDigest`. Every
+         addition would be a decision about image size and about whether it links anything
+         glibc-only — a glibc-linked binary does not execute at all on an alpine-family image, and
+         half of what a pipeline declares is alpine-family. -->
+    <groupId>eu.wohlben.qits</groupId>
+    <artifactId>qits-artifacts-cli</artifactId>
+    <version>2026.906.0</version>
+    <name>qits-artifacts-cli</name>
+
+    <properties>
+        <maven.compiler.release>25</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+        <!-- The binary's name, which is what `ps` shows and what the composed prelude puts on PATH.
+             It is NOT the repository name: the repository is `qits-artifacts-cli` (and so is the
+             daemon-binary artifact it releases), the command is `qits-publish`. -->
+        <binary.name>qits-publish</binary.name>
+        <main.class>eu.wohlben.qits.publish.Main</main.class>
+
+        <!-- Plain JUnit 5. No Mockito and no framework test runner, the qits-ci-daemon rule: fakes
+             are anonymous classes, and the HTTP stub is a real com.sun.net.httpserver on an
+             ephemeral port because the thing under test IS the HTTP conversation. -->
+        <junit.version>5.11.4</junit.version>
+
+        <compiler-plugin.version>3.15.0</compiler-plugin.version>
+        <surefire-plugin.version>3.5.4</surefire-plugin.version>
+        <native-plugin.version>0.10.6</native-plugin.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>${binary.name}</finalName>
+        <plugins>
+            <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${compiler-plugin.version}</version>
+                <configuration>
+                    <parameters>true</parameters>
+                </configuration>
+            </plugin>
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${surefire-plugin.version}</version>
+            </plugin>
+            <plugin>
+                <!-- The jar carries the main class so `java -jar target/qits-publish.jar` is the
+                     same program the binary is. It is a developer convenience and a test of the
+                     manifest, not a shipping form: nothing downloads a jar, and nothing deploys
+                     this artifact anywhere. -->
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.2</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>${main.class}</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <profile>
+            <!-- `./mvnw package -Dnative -DskipTests` makes the binary, and docker/Dockerfile is the
+                 only place that runs it. It needs a GraalVM: the plugin resolves one from
+                 GRAALVM_HOME, then JAVA_HOME, and says so plainly when it finds neither — which is
+                 why the Dockerfile exports GRAALVM_HOME rather than hoping the builder image's
+                 JAVA_HOME happens to be one.
+
+                 The static musl flags below are the point of the exercise, for the reason
+                 qits-ci-daemon's application.properties argues at length: a glibc-linked binary
+                 answers "no such file or directory" on every alpine-family image, and alpine-family
+                 images are half of what a repository declares. `file` then reports "static-pie
+                 linked" rather than the literal "statically linked" — GraalVM emits a
+                 position-independent static executable, so `ldd` is the assertion to write.
+
+                 The fallback image is off because a fallback image is a JVM launcher wearing a
+                 binary's name: it would run on a developer's machine and die in a step container
+                 with no JDK. (An XML comment cannot hold two consecutive dashes, which is why the
+                 flags are named in prose here and spelled once below, where they take effect.) -->
+            <id>native</id>
+            <activation>
+                <property>
+                    <name>native</name>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.graalvm.buildtools</groupId>
+                        <artifactId>native-maven-plugin</artifactId>
+                        <version>${native-plugin.version}</version>
+                        <extensions>true</extensions>
+                        <executions>
+                            <execution>
+                                <id>build-native</id>
+                                <goals>
+                                    <goal>compile-no-fork</goal>
+                                </goals>
+                                <phase>package</phase>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <imageName>${binary.name}</imageName>
+                            <mainClass>${main.class}</mainClass>
+                            <fallback>false</fallback>
+                            <buildArgs>
+                                <buildArg>--static</buildArg>
+                                <buildArg>--libc=musl</buildArg>
+                                <buildArg>--no-fallback</buildArg>
+                                <!-- java.net.http carries its own protocol support, but a URL the
+                                     store hands back can still be opened through java.net.URL by
+                                     the JDK's own plumbing; naming both keeps an https store from
+                                     failing at run time on a handler the image left out. -->
+                                <buildArg>--enable-url-protocols=http,https</buildArg>
+                            </buildArgs>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>
